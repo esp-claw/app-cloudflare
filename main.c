@@ -11,6 +11,9 @@
  *   cf_dns_delete  delete a DNS record by id or name+type (mutation)
  *   cf_purge       purge cached URLs or everything (mutation)
  *   cf_tunnels     Cloudflare Tunnels with status and connections
+ *   cf_tunnel_create  create a remotely managed tunnel (+ optional private network route) (mutation)
+ *   cf_tunnel_route   list, add or remove a tunnel's private network / hostname routes (mutation)
+ *   cf_tunnel_delete  delete a tunnel without connections or routes (mutation)
  *   cf_workers     Workers scripts
  *   cf_analytics   HTTP traffic of a zone (GraphQL POST: the device asks for confirmation)
  * The device injects the API token; the app never sees it. Outputs are compact column/row JSON.
@@ -26,6 +29,7 @@ CLAW_DEFINE_ARENA()
 
 static int32_t s_t_zones = -1, s_t_list = -1, s_t_upsert = -1, s_t_delete = -1;
 static int32_t s_t_purge = -1, s_t_tunnels = -1, s_t_workers = -1, s_t_analytics = -1;
+static int32_t s_t_tun_create = -1, s_t_tun_route = -1, s_t_tun_delete = -1;
 
 static char s_resp[32 * 1024 + 1];
 static uint32_t s_resp_len;
@@ -1144,6 +1148,438 @@ static void tool_tunnels(void)
     out_end();
 }
 
+/* ---------- tunnel setup (the connector token is never fetched) ---------- */
+
+static char s_tun_id[40];
+static char s_tun_name[128];
+static int s_tun_up;
+
+static int is_uuid(const char *s, int32_t n)
+{
+    if (n != 36) {
+        return 0;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        char c = s[i];
+
+        if (i == 8 || i == 13 || i == 18 || i == 23 ? c != '-' :
+                !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Tunnel names as the app creates and looks them up: letters, digits, '.', '-', '_' (case kept). */
+static int is_tunnel_name(const char *s, int32_t n)
+{
+    if (n <= 0) {
+        return 0;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        char c = s[i];
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+                c == '-' || c == '_')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* IPv4/IPv6 network in CIDR notation, by character set only; the API validates the rest. */
+static int is_cidr(const char *s, int32_t n)
+{
+    int32_t slash = -1;
+
+    for (int32_t i = 0; i < n; i++) {
+        char c = s[i];
+
+        if (c == '/') {
+            if (slash >= 0) {
+                return 0;
+            }
+            slash = i;
+        } else if (slash >= 0 ? !(c >= '0' && c <= '9') :
+                   !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '.' ||
+                     c == ':')) {
+            return 0;
+        }
+    }
+    return slash > 1 && n - slash >= 2 && n - slash <= 4;
+}
+
+/* Resolves args.tunnel (name or id) into s_tun_id, s_tun_name, s_tun_up. 1 = ok, else result set. */
+static int tunnel(void)
+{
+    char t[64];
+    int32_t n = arg_str("tunnel", t, sizeof(t));
+    const char *end;
+    const char *r;
+    uint32_t matches = 0;
+    int32_t rc;
+
+    if (!account()) {
+        return 0;
+    }
+    path_begin("/accounts/");
+    bput(&s_p, s_acct);
+    if (is_uuid(t, n)) {
+        bput(&s_p, "/cfd_tunnel/");
+        bput(&s_p, t);
+    } else if (is_tunnel_name(t, n)) {
+        bput(&s_p, "/cfd_tunnel?is_deleted=false&per_page=10&name=");
+        bput(&s_p, t);
+    } else {
+        err_result("tunnel must be a tunnel name or id from cf_tunnels", 0);
+        return 0;
+    }
+    rc = get();
+    end = s_resp + s_resp_len;
+    if (rc != 200 && rc != 404) {
+        account_check(rc);
+        fail("tunnel lookup", rc);
+        return 0;
+    }
+    r = cj_member(s_resp, end, "result");
+    if (r && *r == '[') {
+        const char *hit = 0;
+
+        for (const char *it = cj_first(r, end); it; it = cj_next(it, end)) {
+            char nm[64];
+            int32_t nl = cj_string(cj_member(it, end, "name"), end, nm, sizeof(nm));
+
+            if (nl == n && str_eq(nm, (uint32_t)nl, t)) {
+                hit = it;
+                matches++;
+            }
+        }
+        r = hit;
+    }
+    if (matches > 1) {
+        err_result("several tunnels have this name; pass the id from cf_tunnels", t);
+        return 0;
+    }
+    if (rc != 200 || cj_string(cj_member(r, end, "id"), end, s_tun_id, sizeof(s_tun_id)) != 36 ||
+            cj_string(cj_member(r, end, "name"), end, s_tun_name, sizeof(s_tun_name)) <= 0) {
+        err_result("tunnel not found", t);
+        return 0;
+    }
+    {
+        char status[16];
+
+        n = cj_string(cj_member(r, end, "status"), end, status, sizeof(status));
+        s_tun_up = n > 0 && (str_eq(status, (uint32_t)n, "healthy") || str_eq(status, (uint32_t)n, "degraded"));
+    }
+    return 1;
+}
+
+static void put_tun_name(void)
+{
+    P("\"");
+    put_safe(s_tun_name, s_tun_name + claw_strlen(s_tun_name), 80, SAFE_JSON);
+    P("\"");
+}
+
+#define ROUTE_COLS "[\"kind\",\"target\",\"comment\",\"id\"]"
+
+/* GET of the tunnel's private network routes (hostname = 0) or hostname routes into s_resp. */
+static int32_t get_routes(int hostname)
+{
+    path_begin("/accounts/");
+    bput(&s_p, s_acct);
+    bput(&s_p, hostname ? "/zerotrust/routes/hostname" : "/teamnet/routes");
+    bput(&s_p, "?is_deleted=false&per_page=50&tunnel_id=");
+    bput(&s_p, s_tun_id);
+    return get();
+}
+
+/* Appends both kinds of routes of the tunnel as rows; returns their number, or -1 (result set). */
+static int32_t put_routes(void)
+{
+    int32_t count = 0;
+
+    for (int hostname = 0; hostname < 2; hostname++) {
+        int32_t rc = get_routes(hostname);
+        const char *end = s_resp + s_resp_len;
+
+        if (rc != 200) {
+            fail(hostname ? "GET hostname routes" : "GET teamnet routes", rc);
+            return -1;
+        }
+        for (const char *r = cj_first(cj_member(s_resp, end, "result"), end); r; r = cj_next(r, end)) {
+            if (!cj_skip(r, end)) {
+                s_trunc = 1;
+                break;
+            }
+            row_begin();
+            P(count ? ",[" : "[");
+            P(hostname ? "\"hostname\"," : "\"network\",");
+            put_jstr(cj_member(r, end, hostname ? "hostname" : "network"), end, 120);
+            P(",");
+            put_jstr(cj_member(r, end, "comment"), end, 100);
+            P(",");
+            put_jstr(cj_member(r, end, "id"), end, 40);
+            P("]");
+            if (!row_end()) {
+                break;
+            }
+            count++;
+        }
+    }
+    return count;
+}
+
+/* POSTs a route for s_tun_id: {"network"|"hostname": target, "tunnel_id", "comment"?}. */
+static int32_t post_route(int hostname, const char *target, const char *comment)
+{
+    claw_buf_t body = { s_body, sizeof(s_body), 0, 0 };
+
+    bput(&body, hostname ? "{\"hostname\":\"" : "{\"network\":\"");
+    bput(&body, target);
+    bput(&body, "\",\"tunnel_id\":\"");
+    bput(&body, s_tun_id);
+    if (comment[0]) {
+        bput(&body, "\",\"comment\":\"");
+        bput(&body, comment); /* still JSON-escaped from the arguments */
+    }
+    bput(&body, "\"}");
+    path_begin("/accounts/");
+    bput(&s_p, s_acct);
+    bput(&s_p, hostname ? "/zerotrust/routes/hostname" : "/teamnet/routes");
+    return http("POST", body.buf, body.len);
+}
+
+#define RUN_HINT "On the other host: cloudflared tunnel run --token <token>. Get the token from the dashboard " \
+                 "(Networks > Tunnels) or with `cloudflared tunnel token <id>`; it never passes through this device."
+
+static void tool_tunnel_create(void)
+{
+    char name[64];
+    char net[64];
+    char rid[40] = "";
+    int32_t nn = arg_str("name", name, sizeof(name));
+    int32_t netn = arg_str("network", net, sizeof(net));
+    claw_buf_t body = { s_body, sizeof(s_body), 0, 0 };
+    const char *end;
+    int32_t rc;
+
+    if (!is_tunnel_name(name, nn)) {
+        err_result("name is required: up to 63 letters, digits, '.', '-', '_'", 0);
+        return;
+    }
+    if (cj_member(s_args, s_args_end, "network") && !is_cidr(net, netn)) {
+        err_result("network must be a CIDR like 192.168.1.0/24", 0);
+        return;
+    }
+    if (!account()) {
+        return;
+    }
+    /* Remotely managed: ingress and routes live in Cloudflare, cloudflared only needs the token. */
+    bput(&body, "{\"name\":\"");
+    bput(&body, name);
+    bput(&body, "\",\"config_src\":\"cloudflare\"}");
+    path_begin("/accounts/");
+    bput(&s_p, s_acct);
+    bput(&s_p, "/cfd_tunnel");
+    rc = http("POST", body.buf, body.len);
+    end = s_resp + s_resp_len;
+    /* The response also carries the connector token; only id and name are read from it. */
+    if (rc != 200) {
+        account_check(rc);
+        fail("POST cfd_tunnel", rc);
+        return;
+    }
+    if (cj_string(mem(s_resp, end, "result", "id"), end, s_tun_id, sizeof(s_tun_id)) != 36) {
+        err_result("tunnel created but its id is missing; check cf_tunnels", 0); /* no raw dump: token inside */
+        return;
+    }
+    for (int32_t i = 0; i <= nn; i++) {
+        s_tun_name[i] = name[i];
+    }
+    if (netn > 0) {
+        rc = post_route(0, net, "");
+        end = s_resp + s_resp_len;
+        if (rc != 200 || cj_string(mem(s_resp, end, "result", "id"), end, rid, sizeof(rid)) <= 0) {
+            const char *msg = cj_member(cj_first(cj_member(s_resp, end, "errors"), end), end, "message");
+
+            out_begin();
+            P("{\"ok\":false,\"tunnel\":");
+            put_tun_name();
+            P(",\"id\":\"");
+            P(s_tun_id);
+            P("\",\"error\":\"tunnel created, route failed; retry with cf_tunnel_route\",\"status\":");
+            put_i32(rc);
+            P(",\"detail\":");
+            put_jstr(msg, end, 200);
+            P("}");
+            out_end();
+            return;
+        }
+    }
+    out_begin();
+    P("{\"ok\":true,\"tunnel\":");
+    put_tun_name();
+    P(",\"id\":\"");
+    P(s_tun_id);
+    P("\"");
+    if (rid[0]) {
+        P(",\"network\":\"");
+        P(net);
+        P("\",\"route_id\":\"");
+        P(rid);
+        P("\"");
+    }
+    P(",\"next\":\"" RUN_HINT "\"}");
+    out_end();
+}
+
+static void tool_tunnel_route(void)
+{
+    char target[256];
+    char comment[101] = "";
+    int has_net = cj_member(s_args, s_args_end, "network") != 0;
+    int hostname = cj_member(s_args, s_args_end, "hostname") != 0;
+    int remove = arg_bool("remove") == 1;
+    int32_t tn = arg_str(hostname ? "hostname" : "network", target, sizeof(target));
+    const char *end;
+    char rid[40] = "";
+    int32_t rc;
+
+    if (has_net && hostname) {
+        err_result("pass network or hostname, not both", 0);
+        return;
+    }
+    if (has_net && !is_cidr(target, tn)) {
+        err_result("network must be a CIDR like 192.168.1.0/24", 0);
+        return;
+    }
+    if (hostname && !is_name(target, tn, 0)) {
+        err_result("hostname must be a host name like app.example.com", 0);
+        return;
+    }
+    if (cj_member(s_args, s_args_end, "comment") && arg_str("comment", comment, sizeof(comment)) < 0) {
+        err_result("comment must be a string of up to 100 bytes", 0);
+        return;
+    }
+    if (remove && !has_net && !hostname) {
+        err_result("remove needs the network or hostname of the route", 0);
+        return;
+    }
+    if (!tunnel()) {
+        return;
+    }
+
+    if (!has_net && !hostname) {
+        int32_t n;
+
+        out_begin();
+        P("{\"tunnel\":");
+        put_tun_name();
+        P(",\"cols\":" ROUTE_COLS ",\"rows\":[");
+        if ((n = put_routes()) < 0) {
+            return;
+        }
+        s_b.cap = sizeof(s_out);
+        P("],\"count\":");
+        put_i32(n);
+        P(s_trunc ? ",\"truncated\":true}" : "}");
+        out_end();
+        return;
+    }
+
+    if (remove) {
+        rc = get_routes(hostname);
+        end = s_resp + s_resp_len;
+        if (rc != 200) {
+            fail(hostname ? "GET hostname routes" : "GET teamnet routes", rc);
+            return;
+        }
+        for (const char *r = cj_first(cj_member(s_resp, end, "result"), end); r; r = cj_next(r, end)) {
+            char v[256];
+            int32_t vl = cj_string(cj_member(r, end, hostname ? "hostname" : "network"), end, v, sizeof(v));
+
+            if (vl == tn && str_eq(v, (uint32_t)vl, target)) {
+                cj_string(cj_member(r, end, "id"), end, rid, sizeof(rid));
+                break;
+            }
+        }
+        if (!is_uuid(rid, claw_strlen(rid))) {
+            err_result("the tunnel has no such route", target);
+            return;
+        }
+        path_begin("/accounts/");
+        bput(&s_p, s_acct);
+        bput(&s_p, hostname ? "/zerotrust/routes/hostname/" : "/teamnet/routes/");
+        bput(&s_p, rid);
+        rc = http("DELETE", "", 0);
+        if (rc != 200) {
+            fail(hostname ? "DELETE hostname route" : "DELETE teamnet route", rc);
+            return;
+        }
+    } else {
+        rc = post_route(hostname, target, comment);
+        end = s_resp + s_resp_len;
+        if (rc != 200) {
+            fail(hostname ? "POST hostname route" : "POST teamnet route", rc);
+            return;
+        }
+        cj_string(mem(s_resp, end, "result", "id"), end, rid, sizeof(rid));
+    }
+    out_begin();
+    P(remove ? "{\"ok\":true,\"action\":\"removed\",\"tunnel\":" : "{\"ok\":true,\"action\":\"added\",\"tunnel\":");
+    put_tun_name();
+    P(hostname ? ",\"hostname\":\"" : ",\"network\":\"");
+    P(target);
+    P("\",\"route_id\":\"");
+    P(rid);
+    P(s_tun_up || remove ? "\"}" : "\",\"note\":\"tunnel has no connector yet: start cloudflared on the host\"}");
+    out_end();
+}
+
+static void tool_tunnel_delete(void)
+{
+    int32_t n;
+    int32_t rc;
+
+    if (!tunnel()) {
+        return;
+    }
+    if (s_tun_up) {
+        err_result("tunnel still has connections; stop cloudflared on the host first", 0);
+        return;
+    }
+    /* Routes are not removed implicitly: each removal is its own confirmed request. */
+    out_begin();
+    P("{\"error\":\"remove the tunnel's routes first (cf_tunnel_route remove=true)\",\"cols\":" ROUTE_COLS
+      ",\"rows\":[");
+    if ((n = put_routes()) < 0) {
+        return;
+    }
+    if (n > 0) {
+        s_b.cap = sizeof(s_out);
+        P("]}");
+        out_end();
+        return;
+    }
+    path_begin("/accounts/");
+    bput(&s_p, s_acct);
+    bput(&s_p, "/cfd_tunnel/");
+    bput(&s_p, s_tun_id);
+    rc = http("DELETE", "", 0);
+    if (rc != 200) {
+        fail("DELETE cfd_tunnel", rc);
+        return;
+    }
+    out_begin();
+    P("{\"ok\":true,\"action\":\"deleted\",\"tunnel\":");
+    put_tun_name();
+    P(",\"id\":\"");
+    P(s_tun_id);
+    P("\"}");
+    out_end();
+}
+
 static void tool_workers(void)
 {
     const char *end;
@@ -1324,6 +1760,7 @@ static void tool_analytics(void)
 
 /* ---------- registration and dispatch ---------- */
 
+#define TUNNEL_PROP "\"tunnel\":{\"type\":\"string\",\"description\":\"Tunnel name or id\"}"
 #define ZONE_PROP "\"zone\":{\"type\":\"string\",\"description\":\"Zone name (example.com) or zone id\"}"
 
 CLAW_EXPORT("app_init") void app_init(void)
@@ -1356,6 +1793,22 @@ CLAW_EXPORT("app_init") void app_init(void)
     s_t_tunnels = CLAW_REGISTER("tunnels", "List Cloudflare Tunnels: name, status (healthy/degraded/down/inactive), "
                                 "connection count, data centers, since, id.",
                                 "{\"type\":\"object\",\"properties\":{}}");
+    s_t_tun_create = CLAW_REGISTER("tunnel_create", "Create a remotely managed Cloudflare Tunnel, optionally with a "
+                                   "private network route (CIDR) so WARP clients reach or egress through the host "
+                                   "that runs cloudflared. Returns the id and how to start cloudflared; the connector "
+                                   "token is never returned. The user confirms each request in Telegram.",
+                                   "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},"
+                                   "\"network\":{\"type\":\"string\",\"description\":\"CIDR, e.g. 192.168.1.0/24\"}},"
+                                   "\"required\":[\"name\"]}");
+    s_t_tun_route = CLAW_REGISTER("tunnel_route", "Routes of a tunnel. Without network/hostname: list them. With "
+                                  "network (CIDR) or hostname (public hostname that egresses through the tunnel): "
+                                  "add the route, or remove it with remove=true. The user confirms in Telegram.",
+                                  "{\"type\":\"object\",\"properties\":{" TUNNEL_PROP ",\"network\":{\"type\":"
+                                  "\"string\"},\"hostname\":{\"type\":\"string\"},\"comment\":{\"type\":\"string\"},"
+                                  "\"remove\":{\"type\":\"boolean\"}},\"required\":[\"tunnel\"]}");
+    s_t_tun_delete = CLAW_REGISTER("tunnel_delete", "Delete a tunnel. cloudflared must be stopped and its routes "
+                                   "removed first. The user confirms in Telegram.",
+                                   "{\"type\":\"object\",\"properties\":{" TUNNEL_PROP "},\"required\":[\"tunnel\"]}");
     s_t_workers = CLAW_REGISTER("workers", "List Workers scripts: name, last modified date, handlers.",
                                 "{\"type\":\"object\",\"properties\":{}}");
     s_t_analytics = CLAW_REGISTER("analytics", "HTTP traffic of a zone for the last since_hours (1-72, default 24): "
@@ -1381,6 +1834,12 @@ CLAW_EXPORT("tool_call") int32_t tool_call(int32_t tool, const char *args, uint3
         tool_purge();
     } else if (tool == s_t_tunnels) {
         tool_tunnels();
+    } else if (tool == s_t_tun_create) {
+        tool_tunnel_create();
+    } else if (tool == s_t_tun_route) {
+        tool_tunnel_route();
+    } else if (tool == s_t_tun_delete) {
+        tool_tunnel_delete();
     } else if (tool == s_t_workers) {
         tool_workers();
     } else if (tool == s_t_analytics) {
