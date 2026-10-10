@@ -1,7 +1,7 @@
 {
   "name": "cf",
-  "version": "1.0.0",
-  "description": "Cloudflare: zones, DNS records (list/upsert/delete), cache purge, tunnels, Workers and traffic analytics via the device's cloudflare API profile.",
+  "version": "1.1.0",
+  "description": "Cloudflare: zones, DNS records (list/upsert/delete), cache purge, tunnels (list, create, routes, delete), Workers and traffic analytics via the device's cloudflare API profile.",
   "permissions": {
     "log": true,
     "kv": true,
